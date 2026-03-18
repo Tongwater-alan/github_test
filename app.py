@@ -8,6 +8,7 @@ import numpy as np
 from poison_tester_ui.data.npz_loader import load_npz_splits
 from poison_tester_ui.data.preprocessing import PreprocessConfig, build_preprocess
 from poison_tester_ui.data.preview import sample_preview_items
+from poison_tester_ui.data.channel_utils import align_channels_nhwc
 
 from poison_tester_ui.models.keras_art_factory import build_art_keras_classifier, KerasArtModelInfo
 from poison_tester_ui.models.trainable_package_loader import (
@@ -151,8 +152,9 @@ def ui_load_h5(h5_file, use_logits: bool):
     STATE.keras_info = info
 
     layer_choices = info.layer_names if info.layer_names else []
-    default_feature = layer_choices[-2] if len(layer_choices) >= 2 else (layer_choices[-1] if layer_choices else "")
-    return gr.Markdown(md), gr.Dropdown(choices=layer_choices, value=default_feature), gr.Markdown(f"預設 feature_layer: `{default_feature}`")
+    default_feature = layer_choices[-2] if len(layer_choices) >= 2 else (layer_choices[-1] if layer_choices else None)
+    hint_text = f"預設 feature_layer: `{default_feature}`" if default_feature is not None else "（尚未找到可用層）"
+    return gr.Markdown(md), gr.Dropdown(choices=layer_choices, value=default_feature, allow_custom_value=True), gr.Markdown(hint_text)
 
 
 def _subsample_train(x: np.ndarray, y: np.ndarray, mode: str, cap: str, seed: int):
@@ -191,13 +193,13 @@ def ui_validate_torch_zip(
     if zip_file is None:
         return (
             gr.Markdown("**錯誤**：請上傳 PyTorch zip"),
-            gr.Dropdown(choices=[], value=""),
+            gr.Dropdown(choices=[], value=None, allow_custom_value=True),
             gr.Markdown(""),
         )
     if STATE.splits is None:
         return (
             gr.Markdown("**錯誤**：請先在 Data (NPZ) tab 載入 NPZ"),
-            gr.Dropdown(choices=[], value=""),
+            gr.Dropdown(choices=[], value=None, allow_custom_value=True),
             gr.Markdown(""),
         )
 
@@ -231,13 +233,13 @@ def ui_validate_torch_zip(
     except TrainablePackageError as exc:
         return (
             gr.Markdown(f"**Validate 失敗**：TrainablePackageError: {exc}"),
-            gr.Dropdown(choices=[], value=""),
+            gr.Dropdown(choices=[], value=None, allow_custom_value=True),
             gr.Markdown(""),
         )
     except Exception as exc:
         return (
             gr.Markdown(f"**Validate 失敗**：{type(exc).__name__}: {exc}"),
-            gr.Dropdown(choices=[], value=""),
+            gr.Dropdown(choices=[], value=None, allow_custom_value=True),
             gr.Markdown(""),
         )
 
@@ -361,7 +363,7 @@ def ui_run_torch_feature_collision(
             feature_layer=feature_layer_torch,
             max_iter=int(fc_max_iter),
             similarity_coeff=256.0,
-            watermarking_coeff=0.0,
+            watermark=None,
             learning_rate=float(fc_learning_rate),
             verbose=False,
         )
@@ -470,6 +472,18 @@ def ui_run_full_tf(
     x_train = preprocess.to_numpy_nhwc(splits.x_train, normalize=True)
     x_val = preprocess.to_numpy_nhwc(splits.x_val, normalize=True)
     x_test = preprocess.to_numpy_nhwc(splits.x_test, normalize=True)
+
+    # Auto-align channels between dataset and model (RGB↔grayscale).
+    # STATE.keras_info.input_shape is NHWC, e.g. (None, 28, 28, 1) or (None, 224, 224, 3).
+    model_channels = (
+        int(STATE.keras_info.input_shape[-1])
+        if STATE.keras_info.input_shape and len(STATE.keras_info.input_shape) == 4
+        else None
+    )
+    if model_channels is not None:
+        x_train, x_val, x_test, ch_err = align_channels_nhwc(x_train, x_val, x_test, model_channels)
+        if ch_err is not None:
+            return ch_err, None, None, None, None, None
 
     y_train = splits.y_train.astype(np.int64)
     y_val = splits.y_val.astype(np.int64)
@@ -735,7 +749,7 @@ def main():
             use_logits = gr.Checkbox(value=True, label="use_logits (recommended True)")
             validate_h5 = gr.Button("Validate .h5 & Build ART KerasClassifier")
             h5_status = gr.Markdown()
-            feature_layer = gr.Dropdown(choices=[], value="", label="feature_layer (required for Hidden Trigger)")
+            feature_layer = gr.Dropdown(choices=[], value=None, allow_custom_value=True, label="feature_layer (required for Hidden Trigger)")
             feature_hint = gr.Markdown()
             validate_h5.click(fn=ui_load_h5, inputs=[h5_file, use_logits], outputs=[h5_status, feature_layer, feature_hint])
 
@@ -760,7 +774,7 @@ def main():
 
             validate_torch_btn = gr.Button("Validate zip & load weights (smoke test)")
             torch_status = gr.Markdown()
-            feature_layer_torch = gr.Dropdown(choices=[], value="", label="feature_layer (Torch Feature Collision)")
+            feature_layer_torch = gr.Dropdown(choices=[], value=None, allow_custom_value=True, label="feature_layer (Torch Feature Collision)")
             torch_feature_hint = gr.Markdown()
 
             validate_torch_btn.click(

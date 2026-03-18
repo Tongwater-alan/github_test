@@ -40,9 +40,10 @@ def filter_supported_activation_layers(
     supported: List[str] = []
     for layer in candidate_layers:
         try:
-            acts = classifier.get_activations(
-                dummy, layer_name=layer, batch_size=2, framework=False
-            )
+            # ART PyTorchClassifier.get_activations(x, layer, batch_size, framework)
+            # framework=True returns a framework tensor (torch.Tensor); any non-None
+            # result means the layer is reachable.
+            acts = classifier.get_activations(dummy, layer, batch_size=2, framework=True)
             if acts is not None:
                 supported.append(layer)
         except Exception:
