@@ -41,7 +41,7 @@ def filter_supported_activation_layers(
     for layer in candidate_layers:
         try:
             acts = classifier.get_activations(
-                dummy, layer_name=layer, batch_size=2, framework=False
+                dummy, layer, batch_size=2, framework=True
             )
             if acts is not None:
                 supported.append(layer)
