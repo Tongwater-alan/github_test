@@ -170,11 +170,11 @@ def _subsample_train(x: np.ndarray, y: np.ndarray, mode: str, cap: str, seed: in
     return x[idx], y[idx]
 
 
-def _pick_default_torch_layer(layers: List[str]) -> str:
+def _pick_default_torch_layer(layers: List[str]) -> Optional[str]:
     """Prefer 'net.4' when available; otherwise return the last layer."""
     if "net.4" in layers:
         return "net.4"
-    return layers[-1] if layers else ""
+    return layers[-1] if layers else None
 
 
 def ui_validate_torch_zip(
@@ -191,13 +191,13 @@ def ui_validate_torch_zip(
     if zip_file is None:
         return (
             gr.Markdown("**錯誤**：請上傳 PyTorch zip"),
-            gr.Dropdown(choices=[], value=""),
+            gr.Dropdown(choices=[], value=None, allow_custom_value=True),
             gr.Markdown(""),
         )
     if STATE.splits is None:
         return (
             gr.Markdown("**錯誤**：請先在 Data (NPZ) tab 載入 NPZ"),
-            gr.Dropdown(choices=[], value=""),
+            gr.Dropdown(choices=[], value=None, allow_custom_value=True),
             gr.Markdown(""),
         )
 
@@ -231,13 +231,13 @@ def ui_validate_torch_zip(
     except TrainablePackageError as exc:
         return (
             gr.Markdown(f"**Validate 失敗**：TrainablePackageError: {exc}"),
-            gr.Dropdown(choices=[], value=""),
+            gr.Dropdown(choices=[], value=None, allow_custom_value=True),
             gr.Markdown(""),
         )
     except Exception as exc:
         return (
             gr.Markdown(f"**Validate 失敗**：{type(exc).__name__}: {exc}"),
-            gr.Dropdown(choices=[], value=""),
+            gr.Dropdown(choices=[], value=None, allow_custom_value=True),
             gr.Markdown(""),
         )
 
@@ -263,13 +263,19 @@ def ui_validate_torch_zip(
     STATE.torch_feature_layers = supported
     default_layer = _pick_default_torch_layer(supported)
 
-    hint_lines = [f"- {ln}" for ln in supported[:20]]
-    if len(supported) > 20:
-        hint_lines.append(f"…（共 {len(supported)} 層）")
-    hint_md = (
-        "**支援的 feature_layer（可直接選用）：**\n\n"
-        + ("\n".join(hint_lines) if hint_lines else "（未找到支援層）")
-    )
+    if not supported:
+        hint_md = (
+            "**⚠️ 未找到任何支援的 feature_layer**\n\n"
+            "請確認 `model.py` 的模型結構，或嘗試手動輸入 layer 名稱後執行攻擊。"
+        )
+    else:
+        hint_lines = [f"- {ln}" for ln in supported[:20]]
+        if len(supported) > 20:
+            hint_lines.append(f"…（共 {len(supported)} 層）")
+        hint_md = (
+            "**支援的 feature_layer（可直接選用）：**\n\n"
+            + "\n".join(hint_lines)
+        )
 
     status_md = (
         f"**PyTorch zip 驗證成功**\n\n"
@@ -283,7 +289,7 @@ def ui_validate_torch_zip(
 
     return (
         gr.Markdown(status_md),
-        gr.Dropdown(choices=supported, value=default_layer),
+        gr.Dropdown(choices=supported, value=default_layer, allow_custom_value=True),
         gr.Markdown(hint_md),
     )
 
@@ -760,7 +766,7 @@ def main():
 
             validate_torch_btn = gr.Button("Validate zip & load weights (smoke test)")
             torch_status = gr.Markdown()
-            feature_layer_torch = gr.Dropdown(choices=[], value="", label="feature_layer (Torch Feature Collision)")
+            feature_layer_torch = gr.Dropdown(choices=[], value=None, allow_custom_value=True, label="feature_layer (Torch Feature Collision)")
             torch_feature_hint = gr.Markdown()
 
             validate_torch_btn.click(
