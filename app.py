@@ -1,6 +1,6 @@
 import os
 from dataclasses import asdict  # <-- FIX: add asdict
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 import gradio as gr
 import numpy as np
@@ -10,6 +10,15 @@ from poison_tester_ui.data.preprocessing import PreprocessConfig, build_preproce
 from poison_tester_ui.data.preview import sample_preview_items
 
 from poison_tester_ui.models.keras_art_factory import build_art_keras_classifier, KerasArtModelInfo
+from poison_tester_ui.models.trainable_package_loader import (
+    load_trainable_package,
+    TrainablePackageError,
+    TrainablePackageInfo,
+)
+from poison_tester_ui.models.torch_art_utils import (
+    list_named_module_layers,
+    filter_supported_activation_layers,
+)
 
 from poison_tester_ui.attacks.art_hidden_trigger import HiddenTriggerParams, run_hidden_trigger_backdoor_art
 from poison_tester_ui.attacks.art_clean_label_backdoor import CleanLabelBackdoorParams, run_clean_label_backdoor_art
@@ -40,6 +49,12 @@ class SessionState:
         self.h5_path: Optional[str] = None
         self.art_classifier = None
         self.keras_info: Optional[KerasArtModelInfo] = None
+
+        # PyTorch trainable package
+        self.torch_zip_path: Optional[str] = None
+        self.torch_classifier = None
+        self.torch_info: Optional[TrainablePackageInfo] = None
+        self.torch_feature_layers: List[str] = []
 
         self.last_run_dir: Optional[str] = None
 
@@ -153,6 +168,232 @@ def _subsample_train(x: np.ndarray, y: np.ndarray, mode: str, cap: str, seed: in
     rng = np.random.RandomState(seed)
     idx = rng.choice(x.shape[0], size=ncap, replace=False)
     return x[idx], y[idx]
+
+
+def _pick_default_torch_layer(layers: List[str]) -> str:
+    """Prefer 'net.4' when available; otherwise return the last layer."""
+    if "net.4" in layers:
+        return "net.4"
+    return layers[-1] if layers else ""
+
+
+def ui_validate_torch_zip(
+    zip_file,
+    device: str,
+    shape_mode: str,
+    manual_c: int,
+    manual_h: int,
+    manual_w: int,
+):
+    """Validate a PyTorch zip package, build ART PyTorchClassifier, and discover
+    supported feature layers for the Torch Feature Collision tab."""
+
+    if zip_file is None:
+        return (
+            gr.Markdown("**錯誤**：請上傳 PyTorch zip"),
+            gr.Dropdown(choices=[], value=""),
+            gr.Markdown(""),
+        )
+    if STATE.splits is None:
+        return (
+            gr.Markdown("**錯誤**：請先在 Data (NPZ) tab 載入 NPZ"),
+            gr.Dropdown(choices=[], value=""),
+            gr.Markdown(""),
+        )
+
+    num_classes = STATE.splits.num_classes
+
+    if shape_mode == "auto_from_data":
+        # Infer channel count from dataset format; use preprocess resize_hw
+        if STATE.preprocess_cfg is not None:
+            h, w = STATE.preprocess_cfg.resize_hw
+        else:
+            h, w = 224, 224
+        # Determine channels from dataset format
+        fmt = getattr(STATE.splits, "format", "NHWC")
+        if fmt == "NCHW":
+            c = int(STATE.splits.x_train.shape[1])
+        else:
+            c = int(STATE.splits.x_train.shape[3]) if STATE.splits.x_train.ndim == 4 else 3
+        input_shape_chw: Tuple[int, int, int] = (c, int(h), int(w))
+    else:
+        input_shape_chw = (int(manual_c), int(manual_h), int(manual_w))
+
+    STATE.torch_zip_path = zip_file.name
+
+    try:
+        classifier, info = load_trainable_package(
+            zip_path=zip_file.name,
+            num_classes=num_classes,
+            device=device,
+            input_shape_chw=input_shape_chw,
+        )
+    except TrainablePackageError as exc:
+        return (
+            gr.Markdown(f"**Validate 失敗**：TrainablePackageError: {exc}"),
+            gr.Dropdown(choices=[], value=""),
+            gr.Markdown(""),
+        )
+    except Exception as exc:
+        return (
+            gr.Markdown(f"**Validate 失敗**：{type(exc).__name__}: {exc}"),
+            gr.Dropdown(choices=[], value=""),
+            gr.Markdown(""),
+        )
+
+    STATE.torch_classifier = classifier
+    STATE.torch_info = info
+
+    # Discover supported feature layers
+    try:
+        all_layers = list_named_module_layers(classifier.model)
+        supported = filter_supported_activation_layers(
+            classifier, all_layers, input_shape_chw
+        )
+    except Exception:
+        supported = []
+
+    # Fall back to named_modules list when get_activations probing fails entirely
+    if not supported:
+        try:
+            supported = list_named_module_layers(classifier.model)
+        except Exception:
+            supported = []
+
+    STATE.torch_feature_layers = supported
+    default_layer = _pick_default_torch_layer(supported)
+
+    hint_lines = [f"- {ln}" for ln in supported[:20]]
+    if len(supported) > 20:
+        hint_lines.append(f"…（共 {len(supported)} 層）")
+    hint_md = (
+        "**支援的 feature_layer（可直接選用）：**\n\n"
+        + ("\n".join(hint_lines) if hint_lines else "（未找到支援層）")
+    )
+
+    status_md = (
+        f"**PyTorch zip 驗證成功**\n\n"
+        f"- zip: `{zip_file.name}`\n"
+        f"- device: `{info.device}`\n"
+        f"- input_shape(CHW): `{info.input_shape_chw}`\n"
+        f"- num_classes: `{info.num_classes}`\n"
+        f"- 支援 feature_layer 數: `{len(supported)}`\n"
+        f"- 預設 feature_layer: `{default_layer}`\n"
+    )
+
+    return (
+        gr.Markdown(status_md),
+        gr.Dropdown(choices=supported, value=default_layer),
+        gr.Markdown(hint_md),
+    )
+
+
+def ui_run_torch_feature_collision(
+    feature_layer_torch: str,
+    target_label: int,
+    source_label: int,
+    poison_fraction: float,
+    fc_max_iter: int,
+    fc_learning_rate: float,
+    batch_size: int,
+    seed: int,
+):
+    """Run Torch Feature Collision Attack (ART FeatureCollisionAttack)."""
+
+    if STATE.splits is None or STATE.preprocess is None:
+        return "請先載入 NPZ", None
+    if STATE.torch_classifier is None or STATE.torch_info is None:
+        return "請先在 Model (PyTorch zip) tab 驗證並載入模型", None
+    if not feature_layer_torch:
+        return "請選擇 feature_layer", None
+
+    try:
+        from art.attacks.poisoning import FeatureCollisionAttack
+    except ImportError:
+        return "ART FeatureCollisionAttack 無法匯入，請安裝 adversarial-robustness-toolbox", None
+
+    seed_everything(int(seed))
+    np.random.seed(int(seed))
+
+    splits = STATE.splits
+    preprocess = STATE.preprocess
+    classifier = STATE.torch_classifier
+    info = STATE.torch_info
+
+    run_id = make_run_id()
+    run_dir = os.path.join(".", "run", run_id)
+    ensure_dir(run_dir)
+    ensure_dir(os.path.join(run_dir, "artifacts", "attack"))
+
+    # Build NCHW float32 tensors for PyTorchClassifier (channels_first=True)
+    x_train_nchw = preprocess.to_tensor_batch(splits.x_train).numpy().astype(np.float32)
+    y_train = splits.y_train.astype(np.int64)
+
+    log_lines: List[str] = []
+    def log(s: str):
+        log_lines.append(s)
+
+    log(f"== Torch Feature Collision Attack ==")
+    log(f"feature_layer: {feature_layer_torch}")
+    log(f"target_label: {target_label}, source_label: {source_label}")
+    log(f"poison_fraction: {poison_fraction}, max_iter: {fc_max_iter}")
+
+    # Select source class samples as base images for collision
+    source_idx = np.where(y_train == int(source_label))[0]
+    if source_idx.size == 0:
+        return f"source_label={source_label} 在訓練集中不存在", None
+
+    n_poison = max(1, int(len(source_idx) * float(poison_fraction)))
+    rng = np.random.RandomState(int(seed))
+    chosen = rng.choice(source_idx, size=n_poison, replace=False)
+    x_base = x_train_nchw[chosen]
+
+    # Select a target sample to collide with
+    target_idx = np.where(y_train == int(target_label))[0]
+    if target_idx.size == 0:
+        return f"target_label={target_label} 在訓練集中不存在", None
+    x_target = x_train_nchw[target_idx[:1]]
+
+    try:
+        attack = FeatureCollisionAttack(
+            classifier=classifier,
+            target=x_target,
+            feature_layer=feature_layer_torch,
+            max_iter=int(fc_max_iter),
+            similarity_coeff=256.0,
+            watermarking_coeff=0.0,
+            learning_rate=float(fc_learning_rate),
+            verbose=False,
+        )
+        x_poisoned, _ = attack.poison(x_base)
+    except Exception as exc:
+        return f"FeatureCollisionAttack 失敗：{type(exc).__name__}: {exc}", None
+
+    poisoned_count = x_poisoned.shape[0]
+    log(f"poisoned_count: {poisoned_count}")
+
+    save_json(
+        os.path.join(run_dir, "artifacts", "attack", "fc_meta.json"),
+        {
+            "feature_layer": feature_layer_torch,
+            "target_label": int(target_label),
+            "source_label": int(source_label),
+            "poisoned_count": poisoned_count,
+            "max_iter": int(fc_max_iter),
+            "learning_rate": float(fc_learning_rate),
+        },
+    )
+
+    zip_path = zip_dir(run_dir)
+    STATE.last_run_dir = run_dir
+
+    summary_md = (
+        f"### Torch Feature Collision 完成\n"
+        f"- feature_layer: `{feature_layer_torch}`\n"
+        f"- poisoned_count: **{poisoned_count}**\n"
+        f"- output: `{run_dir}`\n"
+    )
+    return "\n".join(log_lines) + "\n\n" + summary_md, zip_path
 
 
 def _eval_art_classifier(classifier, x_nhwc: np.ndarray, y_int: np.ndarray, batch_size: int) -> float:
@@ -468,7 +709,8 @@ def main():
         gr.Markdown(
             "# Poison Tester UI (TF/Keras + ART 1.20.1)\n"
             "- Hidden Trigger + Clean-label Backdoor + Defenses\n"
-            "- Feature collision TF：禁用（ART 1.20.1 僅支援 PyTorchClassifier）"
+            "- Feature collision TF：禁用（ART 1.20.1 僅支援 PyTorchClassifier）\n"
+            "- Feature collision PyTorch：請使用 **Model (PyTorch zip)** + **Torch Feature Collision** tabs"
         )
 
         with gr.Tab("Data (NPZ)"):
@@ -496,6 +738,36 @@ def main():
             feature_layer = gr.Dropdown(choices=[], value="", label="feature_layer (required for Hidden Trigger)")
             feature_hint = gr.Markdown()
             validate_h5.click(fn=ui_load_h5, inputs=[h5_file, use_logits], outputs=[h5_status, feature_layer, feature_hint])
+
+        with gr.Tab("Model (PyTorch zip)"):
+            gr.Markdown(
+                "上傳包含 `model.py`（含 `build_model(num_classes)`）與 `weights.pth` 的 zip 檔，\n"
+                "驗證後會自動探測支援的 `feature_layer` 並填入 **Torch Feature Collision** tab 的下拉選單。"
+            )
+            torch_zip_file = gr.File(label="Upload PyTorch zip (model.py + weights.pth)")
+            torch_device = gr.Radio(choices=["cpu", "cuda"], value="cpu", label="Device")
+
+            gr.Markdown("### input_shape 規則（B + C）")
+            gr.Markdown(
+                "- **auto_from_data**：使用 NPZ 推通道數 + 使用 Data tab 的 resize_hw\n"
+                "- **manual**：手動輸入 C/H/W 覆寫（模型若對尺寸敏感，建議用 manual）"
+            )
+            torch_shape_mode = gr.Radio(choices=["auto_from_data", "manual"], value="auto_from_data", label="Shape mode")
+            with gr.Row():
+                torch_manual_c = gr.Number(value=3, precision=0, label="C (channels, manual)")
+                torch_manual_h = gr.Number(value=224, precision=0, label="H (height, manual)")
+                torch_manual_w = gr.Number(value=224, precision=0, label="W (width, manual)")
+
+            validate_torch_btn = gr.Button("Validate zip & load weights (smoke test)")
+            torch_status = gr.Markdown()
+            feature_layer_torch = gr.Dropdown(choices=[], value="", label="feature_layer (Torch Feature Collision)")
+            torch_feature_hint = gr.Markdown()
+
+            validate_torch_btn.click(
+                fn=ui_validate_torch_zip,
+                inputs=[torch_zip_file, torch_device, torch_shape_mode, torch_manual_c, torch_manual_h, torch_manual_w],
+                outputs=[torch_status, feature_layer_torch, torch_feature_hint],
+            )
 
         with gr.Tab("Training"):
             train_mode = gr.Radio(choices=["Quick", "Normal"], value="Quick", label="Mode")
@@ -549,6 +821,40 @@ def main():
                     do_spectral, do_activation, reject_rate_target,
                 ],
                 outputs=[run_log, metrics_md, plot_a, plot_b, plot_c, download_zip],
+            )
+
+        with gr.Tab("Torch Feature Collision"):
+            gr.Markdown(
+                "### Torch Feature Collision Attack (ART FeatureCollisionAttack)\n"
+                "請先完成：**Data (NPZ)** → **Model (PyTorch zip)** → 點擊 *Validate zip & load weights*，\n"
+                "再回到此頁執行攻擊。`feature_layer` 下拉選單由驗證步驟自動填入，只會列出模型實際支援的層。"
+            )
+            fc_feature_layer = feature_layer_torch  # shared Dropdown from PyTorch zip tab
+            fc_target_label = gr.Number(value=0, precision=0, label="Target label (int)")
+            fc_source_label = gr.Number(value=1, precision=0, label="Source label (int)")
+            fc_poison_fraction = gr.Slider(0.01, 0.5, value=0.05, step=0.01, label="Poison fraction")
+            fc_max_iter = gr.Slider(1, 500, value=100, step=10, label="max_iter")
+            fc_learning_rate = gr.Number(value=0.01, label="learning_rate")
+            fc_batch_size = gr.Dropdown(choices=[8, 16, 32, 64], value=32, label="Batch size")
+            fc_seed = gr.Number(value=1234, precision=0, label="Seed")
+
+            run_fc_btn = gr.Button("Run Torch Feature Collision")
+            fc_log = gr.Textbox(label="Log & Summary", lines=12)
+            fc_download = gr.File(label="Download run folder (.zip)")
+
+            run_fc_btn.click(
+                fn=ui_run_torch_feature_collision,
+                inputs=[
+                    fc_feature_layer,
+                    fc_target_label,
+                    fc_source_label,
+                    fc_poison_fraction,
+                    fc_max_iter,
+                    fc_learning_rate,
+                    fc_batch_size,
+                    fc_seed,
+                ],
+                outputs=[fc_log, fc_download],
             )
 
     demo.launch()
